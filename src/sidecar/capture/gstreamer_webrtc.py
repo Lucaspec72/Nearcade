@@ -150,6 +150,9 @@ class GstWebRTCBackend:
         # User has up to 60 s to make a selection
         GLib.timeout_add_seconds(60, portal_loop.quit)
         portal_loop.run()
+        
+        # Keep session alive by not closing the session handle
+        # The fd should remain valid as long as the session is alive
         return fd_out, node_id_out
 
     # ── Init ──────────────────────────────────────────────────────────────────
@@ -163,8 +166,13 @@ class GstWebRTCBackend:
         args, _ = parser.parse_known_args()
 
         # ── Resolve capture source ─────────────────────────────────────────
-        if args.node:
-            capture_element = f"pipewiresrc path={args.node}"
+        # Portal tokens (window:X:Y or screen:X:Y) are not headless node IDs.
+        # They indicate the user selected a window/screen via the portal.
+        # In this case, we must trigger the portal flow to get fd+node_id.
+        is_portal_token = args.node and (args.node.startswith('window:') or args.node.startswith('screen:'))
+        
+        if args.node and not is_portal_token:
+            capture_element = f"pipewiresrc path={args.node} do-timestamp=true"
             emit_ipc({"type": "info", "message": f"Headless PipeWire capture: node {args.node}"})
         else:
             emit_ipc({"type": "info", "message": "Requesting Wayland XDG Portal capture..."})
@@ -172,7 +180,7 @@ class GstWebRTCBackend:
             if fd is None:
                 emit_ipc({"type": "error", "message": "Portal denied or timed out."})
                 sys.exit(1)
-            capture_element = f"pipewiresrc fd={fd} path={node_id}"
+            capture_element = f"pipewiresrc fd={fd} path={node_id} do-timestamp=true"
             emit_ipc({"type": "info", "message": f"Portal capture: fd={fd} node={node_id}"})
 
         # ── Pipeline ───────────────────────────────────────────────────────
@@ -183,24 +191,128 @@ class GstWebRTCBackend:
         #  - queue elements prevent blocking between encode and network stages
         #  - stun-server property gives webrtcbin public IP awareness
         # Auto-detect Hardware Encoding
-        # Force Software Encoder (x264enc) for all Linux captures.
-        # Hardware encoders like vaapih264enc frequently crash the GStreamer pipeline
-        # during DMABuf memory uploads, which kills both WebRTC and the thumbnail feed.
+        # For portal-based capture, use software encoder (x264enc) because the XDG Desktop Portal
+        # provides RGBA/BGRA format, but hardware encoders (vaapih264enc, vaapih265enc, etc.)
+        # require NV12 input. The NV12 requirement propagates upstream and causes negotiation
+        # failure with the portal. Hardware encoding is used for headless PipeWire nodes
+        # (Gamescope/SteamVR) via the Rust backend.
         hw_encoder = "x264enc tune=zerolatency speed-preset=ultrafast byte-stream=true"
-        emit_ipc({"type": "info", "message": "Using stable Software Encoder (x264enc)"})
+        encoder_name = "x264enc (software)"
+        needs_capsfilter = False
+        emit_ipc({"type": "info", "message": "Using stable Software Encoder (x264enc) for portal capture"})
+
+        # Hardware encoders (VAAPI/NVENC/Vulkan) are only used for headless PipeWire nodes
+        # via the Rust backend (gst-nearcade), which receives NV12 directly from the compositor.
+
+        # Check for NVENC (NVIDIA) - check for H.264, H.265, VP9, AV1 support
+        if encoder_name == "x264enc (software fallback)":
+            try:
+                subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=2)
+                # Check for NVENC capabilities via gst-inspect
+                result = subprocess.run(["gst-inspect-1.0", "nvh265enc"], capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    hw_encoder = "nvh265enc preset=low-latency-hq bitrate=8000 gop-size=30 rc-mode=cbr"
+                    encoder_name = "nvh265enc (NVENC)"
+                else:
+                    hw_encoder = "nvh264enc preset=low-latency-hq bitrate=8000 gop-size=30 rc-mode=cbr"
+                    encoder_name = "nvh264enc (NVENC)"
+                needs_capsfilter = True
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        # Check for AMD VAAPI/Vulkan encoders
+        if encoder_name == "x264enc (software fallback)":
+            try:
+                result = subprocess.run(["gst-inspect-1.0", "vulkanh264enc"], capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    hw_encoder = "vulkanh264enc rate-control=cbr bitrate=8000 gop-size=30"
+                    encoder_name = "vulkanh264enc (Vulkan/AMD)"
+                    needs_capsfilter = True
+                else:
+                    # Try VAAPI AMD - check both vaapi and va plugins
+                    result = subprocess.run(["gst-inspect-1.0", "vaapih265enc"], capture_output=True, timeout=2)
+                    if result.returncode == 0:
+                        hw_encoder = "vaapih265enc tune=low-power rate-control=cbr bitrate=8000 keyframe-period=30"
+                        encoder_name = "vaapih265enc (VAAPI/AMD)"
+                        needs_capsfilter = True
+                    else:
+                        # Try va plugin AMD encoders
+                        result = subprocess.run(["gst-inspect-1.0", "vah265enc"], capture_output=True, timeout=2)
+                        if result.returncode == 0:
+                            hw_encoder = "vah265enc tune=low-power rate-control=cbr bitrate=8000 keyframe-period=30"
+                            encoder_name = "vah265enc (VAAPI/AMD)"
+                            needs_capsfilter = True
+                        else:
+                            result = subprocess.run(["gst-inspect-1.0", "vaapih264enc"], capture_output=True, timeout=2)
+                            if result.returncode == 0:
+                                hw_encoder = "vaapih264enc tune=low-power rate-control=cbr bitrate=8000 keyframe-period=30"
+                                encoder_name = "vaapih264enc (VAAPI/AMD)"
+                                needs_capsfilter = True
+                            else:
+                                result = subprocess.run(["gst-inspect-1.0", "vah264enc"], capture_output=True, timeout=2)
+                                if result.returncode == 0:
+                                    hw_encoder = "vah264enc tune=low-power rate-control=cbr bitrate=8000 keyframe-period=30"
+                                    encoder_name = "vah264enc (VAAPI/AMD)"
+                                    needs_capsfilter = True
+                                else:
+                                    hw_encoder = "vaapih264enc tune=low-power rate-control=cbr bitrate=8000 keyframe-period=30"
+                                    encoder_name = "vaapih264enc (VAAPI/AMD)"
+                                    needs_capsfilter = True
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        # Determine supported codecs based on encoder
+        supported_codecs = ["H264"]
+        if "vaapih264enc" in hw_encoder or "vah264enc" in hw_encoder:
+            supported_codecs.extend(["H265", "VP9"])
+        elif "vaapih265enc" in hw_encoder or "vah265enc" in hw_encoder:
+            supported_codecs.extend(["H264", "VP9", "AV1"])
+        elif "vaapivp9enc" in hw_encoder:
+            supported_codecs.extend(["H264", "H265", "AV1"])
+        elif "vaapiav1enc" in hw_encoder or "vaav1enc" in hw_encoder:
+            supported_codecs.extend(["H264", "H265", "VP9"])
+        elif "nvh264enc" in hw_encoder:
+            supported_codecs.extend(["H265", "VP9"])
+        elif "nvh265enc" in hw_encoder:
+            supported_codecs.extend(["H264", "VP9", "AV1"])
+        elif "vulkanh264enc" in hw_encoder:
+            supported_codecs.extend(["H265"])
+        elif "x264enc" in hw_encoder:
+            supported_codecs = ["H264"]
+
+        emit_ipc({"type": "info", "message": f"Using encoder: {encoder_name}"})
+        emit_ipc({"type": "info", "message": f"Supported codecs: {', '.join(supported_codecs)}"})
+
+        # Select rtppay element based on encoder
+        if "vaapih264enc" in hw_encoder or "vah264enc" in hw_encoder or "nvh264enc" in hw_encoder or "vulkanh264enc" in hw_encoder or "x264enc" in hw_encoder:
+            rtppay = "rtph264pay config-interval=-1 aggregate-mode=zero-latency"
+            rtp_caps = "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
+        elif "vaapih265enc" in hw_encoder or "vah265enc" in hw_encoder or "nvh265enc" in hw_encoder:
+            rtppay = "rtph265pay"
+            rtp_caps = "application/x-rtp,media=video,encoding-name=H265,payload=96,clock-rate=90000"
+        elif "vaapivp9enc" in hw_encoder or "nvvp9enc" in hw_encoder:
+            rtppay = "rtpvp9pay"
+            rtp_caps = "application/x-rtp,media=video,encoding-name=VP9,payload=96,clock-rate=90000"
+        elif "vaapiav1enc" in hw_encoder or "vaav1enc" in hw_encoder:
+            rtppay = "rtpav1pay"
+            rtp_caps = "application/x-rtp,media=video,encoding-name=AV1,payload=96,clock-rate=90000"
+        else:
+            rtppay = "rtph264pay config-interval=-1 aggregate-mode=zero-latency"
+            rtp_caps = "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
 
         PIPELINE_DESC = f"""
             webrtcbin name=sendrecv bundle-policy=max-bundle stun-server={STUN_SERVER}
             
-            {capture_element} do-timestamp=true
-              ! video/x-raw ! videoconvert
+            {capture_element}
+              ! videoconvert
               ! tee name=t
               
             t. ! queue max-size-time=500000000 leaky=downstream
-              ! videoconvert
+              ! queue max-size-buffers=4 leaky=downstream
+              ! capsfilter caps=video/x-raw,format=NV12
               ! {hw_encoder}
-              ! rtph264pay config-interval=-1 aggregate-mode=zero-latency
-              ! application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000
+              ! {rtppay}
+              ! {rtp_caps}
               ! sendrecv.
               
             t. ! queue max-size-buffers=1 leaky=downstream
@@ -219,7 +331,7 @@ class GstWebRTCBackend:
               ! queue max-size-time=500000000 leaky=downstream
               ! sendrecv.
         """
-
+        
         try:
             self.pipe = Gst.parse_launch(PIPELINE_DESC)
         except GLib.Error as e:

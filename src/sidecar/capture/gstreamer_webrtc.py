@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# gstreamer_webrtc.py — Native GStreamer WebRTC Backend
+# gstreamer_webrtc.py  Native GStreamer WebRTC Backend
 # ==============================================================================
 # Handles WebRTC signaling (SDP Offers/Answers + ICE) and capture via
 # PipeWire. Falls back to XDG Desktop Portal if no headless node is found.
@@ -49,13 +49,12 @@ def cleanup_and_exit(signum, frame):
 signal.signal(signal.SIGTERM, cleanup_and_exit)
 signal.signal(signal.SIGINT, cleanup_and_exit)
 
-# ─── STUN Servers (same pool as host.js) ──────────────────────────────────────
+#  STUN Servers (same pool as host.js)
 STUN_SERVER = "stun://stun.l.google.com:19302"
-
 
 class GstWebRTCBackend:
 
-    # ── XDG Desktop Portal Screencast ─────────────────────────────────────────
+    #  XDG Desktop Portal Screencast
     def request_portal_screencast(self):
         bus = dbus.SessionBus()
         sender = bus.get_unique_name()[1:].replace('.', '_')
@@ -150,12 +149,12 @@ class GstWebRTCBackend:
         # User has up to 60 s to make a selection
         GLib.timeout_add_seconds(60, portal_loop.quit)
         portal_loop.run()
-        
+
         # Keep session alive by not closing the session handle
         # The fd should remain valid as long as the session is alive
         return fd_out, node_id_out
 
-    # ── Init ──────────────────────────────────────────────────────────────────
+    #  Init
     def __init__(self):
         Gst.init(None)
         self.loop = GLib.MainLoop()
@@ -165,12 +164,12 @@ class GstWebRTCBackend:
         parser.add_argument('--node', type=str, help='PipeWire serial to capture headlessly')
         args, _ = parser.parse_known_args()
 
-        # ── Resolve capture source ─────────────────────────────────────────
+        #  Resolve capture source
         # Portal tokens (window:X:Y or screen:X:Y) are not headless node IDs.
         # They indicate the user selected a window/screen via the portal.
         # In this case, we must trigger the portal flow to get fd+node_id.
         is_portal_token = args.node and (args.node.startswith('window:') or args.node.startswith('screen:'))
-        
+
         if args.node and not is_portal_token:
             capture_element = f"pipewiresrc path={args.node} do-timestamp=true"
             emit_ipc({"type": "info", "message": f"Headless PipeWire capture: node {args.node}"})
@@ -183,7 +182,7 @@ class GstWebRTCBackend:
             capture_element = f"pipewiresrc fd={fd} path={node_id} do-timestamp=true"
             emit_ipc({"type": "info", "message": f"Portal capture: fd={fd} node={node_id}"})
 
-        # ── Pipeline ───────────────────────────────────────────────────────
+        #  Pipeline
         # Notes:
         #  - capsfilter after pipewiresrc allows any raw format through
         #  - videorate stabilises variable-FPS portal streams
@@ -298,42 +297,47 @@ class GstWebRTCBackend:
             rtp_caps = "application/x-rtp,media=video,encoding-name=AV1,payload=96,clock-rate=90000"
         else:
             rtppay = "rtph264pay config-interval=-1 aggregate-mode=zero-latency"
-            rtp_caps = "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
-
-        PIPELINE_DESC = f"""
-            webrtcbin name=sendrecv bundle-policy=max-bundle stun-server={STUN_SERVER}
-            
-            {capture_element}
-              ! videoconvert
-              ! tee name=t
-              
-            t. ! queue max-size-time=500000000 leaky=downstream
-              ! queue max-size-buffers=4 leaky=downstream
-              ! capsfilter caps=video/x-raw,format=NV12
-              ! {hw_encoder}
-              ! {rtppay}
-              ! {rtp_caps}
-              ! sendrecv.
-              
-            t. ! queue max-size-buffers=1 leaky=downstream
-              ! videoconvert
-              ! videoscale ! video/x-raw,width=1280,height=720
-              ! videorate ! video/x-raw,framerate=60/1
-              ! jpegenc quality=65
-              ! appsink name=thumb_sink emit-signals=true max-buffers=1 drop=true sync=false
-              
-            pulsesrc
-              ! audio/x-raw,rate=48000,channels=1
-              ! audioconvert ! audioresample
-              ! opusenc bitrate=128000
-              ! rtpopuspay
-              ! application/x-rtp,media=audio,encoding-name=OPUS,payload=97,clock-rate=48000
-              ! queue max-size-time=500000000 leaky=downstream
-              ! sendrecv.
-        """
-        
+            # Pipeline description template - defined as class attribute to avoid module-level formatting issues
+        _PIPELINE_TEMPLATE = (
+            "webrtcbin name=sendrecv bundle-policy=max-bundle stun-server={STUN_SERVER}\n"
+            "\n"
+            "{capture_element}\n"
+            "  ! tee name=t\n"
+            "\n"
+            "t. ! queue max-size-time=500000000 leaky=downstream\n"
+            "  ! queue max-size-buffers=4\n"
+            "  ! videoconvert\n"
+            "  ! {hw_encoder}\n"
+            "  ! rtph264pay config-interval=-1 aggregate-mode=zero-latency\n"
+            "  ! application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\n"
+            "  ! sendrecv.\n"
+            "\n"
+            "t. ! queue max-size-buffers=1 leaky=downstream\n"
+            "  ! videoconvert\n"
+            "  ! videoscale ! video/x-raw,width=1280,height=720\n"
+            "  ! videorate ! video/x-raw,framerate=60/1\n"
+            "  ! jpegenc quality=65\n"
+            "  ! appsink name=thumb_sink emit-signals=true max-buffers=1 drop=true sync=false\n"
+            "\n"
+            "pulsesrc\n"
+            "  ! audio/x-raw,rate=48000,channels=1\n"
+            "  ! audioconvert ! audioresample\n"
+            "  ! opusenc bitrate=128000\n"
+            "  ! rtpopuspay\n"
+            "  ! application/x-rtp,media=audio,encoding-name=OPUS,payload=97,clock-rate=48000\n"
+            "  ! queue max-size-time=500000000 leaky=downstream\n"
+            "  ! sendrecv."
+        )
+        # Pipeline description built; parse and launch
         try:
-            self.pipe = Gst.parse_launch(PIPELINE_DESC)
+            pipeline_str = self._PIPELINE_TEMPLATE.format(
+                STUN_SERVER=STUN_SERVER,
+                capture_element=capture_element,
+                hw_encoder=hw_encoder,
+                rtppay=rtppay,
+                rtp_caps=rtp_caps
+            )
+            self.pipe = Gst.parse_launch(pipeline_str)
         except GLib.Error as e:
             emit_ipc({"type": "error", "message": f"Pipeline parse error: {e}"})
             sys.exit(1)
@@ -352,7 +356,7 @@ class GstWebRTCBackend:
         bus.add_signal_watch()
         bus.connect('message::error', self.on_bus_error)
         bus.connect('message::state-changed', self.on_state_changed)
-        
+
         # Connect appsink to extract thumbnails
         thumb_sink = self.pipe.get_by_name("thumb_sink")
         if thumb_sink:
@@ -362,7 +366,7 @@ class GstWebRTCBackend:
         if ret == Gst.StateChangeReturn.FAILURE:
             emit_ipc({"type": "error", "message": "Pipeline failed to start (PLAYING state failed)."})
             sys.exit(1)
-            
+
     def on_new_thumbnail(self, sink):
         try:
             # Throttle: 60fps cap (~16ms). Drain bursts after stalls.
@@ -383,18 +387,18 @@ class GstWebRTCBackend:
                 emit_ipc({"type": "thumbnail", "data": b64})
                 buf.unmap(mapinfo)
                 self._last_thumb_ts = now
-                
+
                 if not hasattr(self, 'frame_count'):
                     self.frame_count = 0
                 self.frame_count += 1
                 if self.frame_count % 50 == 0:
                     emit_ipc({"type": "info", "message": f"Thumbnail frame {self.frame_count}"})
-                
+
         except Exception as e:
             emit_ipc({"type": "error", "message": f"Thumbnail error: {e}"})
         return Gst.FlowReturn.OK
 
-    # ── GStreamer Bus Callbacks ────────────────────────────────────────────────
+    #  GStreamer Bus Callbacks
     def on_bus_error(self, bus, message):
         err, debug = message.parse_error()
     def on_state_changed(self, bus, message):
@@ -403,9 +407,9 @@ class GstWebRTCBackend:
         old, new, pending = message.parse_state_changed()
         emit_ipc({"type": "info", "message": f"Pipeline state: {old.value_nick} -> {new.value_nick}"})
 
-    # ── WebRTC Offer / Answer ─────────────────────────────────────────────────
+    #  WebRTC Offer / Answer
     def on_negotiation_needed(self, element):
-        emit_ipc({"type": "info", "message": "WebRTC negotiation needed — creating offer"})
+        emit_ipc({"type": "info", "message": "WebRTC negotiation needed  creating offer"})
         promise = Gst.Promise.new_with_change_func(self.on_offer_created, element, None)
         element.emit('create-offer', None, promise)
 
@@ -429,7 +433,7 @@ class GstWebRTCBackend:
             'candidate': candidate
         }), flush=True)
 
-    # ── Handle Viewer Answer + ICE ─────────────────────────────────────────────
+    #  Handle Viewer Answer + ICE
     def handle_incoming_sdp(self, sdp_string):
         try:
             res, sm = Gst.SDPMessage.new()
@@ -451,7 +455,7 @@ class GstWebRTCBackend:
             emit_ipc({"type": "error", "message": f"Failed to add ICE candidate: {e}"})
         return False  # Remove from GLib idle
 
-    # ── Stdin Reader (Signaling from Node.js → Python) ────────────────────────
+    #  Stdin Reader (Signaling from Node.js  Python)
     def read_stdin(self):
         for raw_line in sys.stdin:
             raw_line = raw_line.strip()
@@ -465,18 +469,18 @@ class GstWebRTCBackend:
             msg_type = msg.get('type', '')
 
             if msg_type == 'answer':
-                # Viewer's SDP answer — extract sdp string
+                # Viewer's SDP answer  extract sdp string
                 sdp_val = msg.get('sdp', '')
                 sdp_str = sdp_val.get('sdp') if isinstance(sdp_val, dict) else str(sdp_val)
                 if sdp_str:
                     GLib.idle_add(self.handle_incoming_sdp, sdp_str)
 
             elif msg_type == 'ice-viewer':
-                # ──────────────────────────────────────────────────────────────
+                #
                 # CRITICAL: viewer.js sends { type: 'ice-viewer', candidate: RTCIceCandidate }
                 # RTCIceCandidate serialises as { candidate: "...", sdpMLineIndex: N, ... }
                 # We need the raw candidate SDP line string and the mline index.
-                # ──────────────────────────────────────────────────────────────
+                #
                 cand_obj = msg.get('candidate', {})
                 if isinstance(cand_obj, dict):
                     candidate_str = cand_obj.get('candidate', '')
@@ -492,9 +496,9 @@ class GstWebRTCBackend:
         threading.Thread(target=self.read_stdin, daemon=True).start()
         self.loop.run()
 
-
 if __name__ == '__main__':
     # Must set DBus main loop before any dbus calls
     DBusGMainLoop(set_as_default=True)
     backend = GstWebRTCBackend()
     backend.start()
+

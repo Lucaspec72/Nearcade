@@ -297,8 +297,8 @@ class GstWebRTCBackend:
             rtp_caps = "application/x-rtp,media=video,encoding-name=AV1,payload=96,clock-rate=90000"
         else:
             rtppay = "rtph264pay config-interval=-1 aggregate-mode=zero-latency"
-            # Pipeline description template - defined as class attribute to avoid module-level formatting issues
-        _PIPELINE_TEMPLATE = (
+            # Pipeline description template - defined as instance attribute to avoid module-level formatting issues
+        self._PIPELINE_TEMPLATE = (
             "webrtcbin name=sendrecv bundle-policy=max-bundle stun-server={STUN_SERVER}\n"
             "\n"
             "{capture_element}\n"

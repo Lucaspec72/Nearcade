@@ -52,7 +52,7 @@ const DEFAULTS = {
   useSystemAccent: false,
   useNativeTheme: false,
   checkForUpdates: true,
-  captureMethod: process.platform === 'linux' ? 'gstreamer_webrtc' : 'webcodecs',
+  captureMethod: 'webcodecs',
 };
 
 function loadSettings() {

@@ -1535,7 +1535,8 @@ function connectWS() {
         if (msg.type === 'thumbnail') {
             const mjpegImg = document.getElementById('ns-gstreamer-mjpeg');
             if (mjpegImg) {
-                mjpegImg.src = 'data:image/jpeg;base64,' + msg.data;
+                // Add timestamp to prevent browser caching
+                mjpegImg.src = 'data:image/jpeg;base64,' + msg.data + '?t=' + Date.now();
                 mjpegImg.style.display = 'block';
             }
             return;
@@ -2484,6 +2485,11 @@ async function swapPipeline(newPipeline) {
         if (_wcEncoder && _wcEncoder.state !== 'closed') {
             try { _wcEncoder.close(); } catch (_) {}
             _wcEncoder = null;
+        }
+        
+        // Persist the pipeline selection to settings so it persists across restarts
+        if (window.electronAPI && window.electronAPI.saveSettingsSync) {
+            await window.electronAPI.saveSettingsSync({ captureMethod: newPipeline });
         }
         
         // Restart with new pipeline (reuses current video track)
@@ -4636,7 +4642,7 @@ function saveCaptureMethod(method) {
         else if (urlParams.get('wc') === '2') activeMethod = 'custom_webcodecs';
         else if (urlParams.get('ff') === '1' || (typeof process !== 'undefined' && process.argv?.includes('--ffmpeg'))) activeMethod = 'ffmpeg';
         else if (urlParams.get('gst') === '1') activeMethod = 'gstreamer_webrtc';
-        else activeMethod = 'native';
+        else activeMethod = 'webcodecs';
     }
 
     // If a stream is already active, try hot-swap instead of restart
@@ -6242,7 +6248,11 @@ function togglePreview() {
         log(I18N.t('Preview hidden — stream unaffected'), 'ok');
     } else {
         if (isGst) {
-            if (mjpegImg) mjpegImg.style.display = 'block';
+            if (mjpegImg) {
+                mjpegImg.style.display = 'block';
+                // Force refresh of MJPEG preview by updating src with timestamp
+                mjpegImg.src = mjpegImg.src.split('?')[0] + '?t=' + Date.now();
+            }
             if (prev) prev.style.display = 'none'; // Keep video hidden, only show MJPEG
             if (overlay) overlay.classList.add('hidden');
         } else {

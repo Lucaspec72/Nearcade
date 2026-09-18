@@ -1743,6 +1743,34 @@ async function main() {
     }
   });
 
+  // ── EverLink relay events — forwarded to the host UI's settings panel ──────
+  // (see everlink_backend.py's module docstring for the underlying wire
+  // protocol, and toEverlink/inputDriver.everlink* below for the request
+  // side). These fire only once the host has actually touched an
+  // everlink-* control, since InputOrchestrator only spawns the sidecar
+  // lazily on first use.
+  inputDriver.events.on('everlink-relay-list', (data) => {
+    if (hostWS && hostWS.readyState === 1) {
+      hostWS.send(JSON.stringify({ type: 'everlink-relay-list', relays: data.relays || [] }));
+    }
+  });
+  inputDriver.events.on('everlink-relay-added', (data) => {
+    if (hostWS && hostWS.readyState === 1) {
+      hostWS.send(JSON.stringify({ type: 'everlink-relay-added', relay: data.relay }));
+    }
+  });
+  inputDriver.events.on('everlink-relay-removed', (data) => {
+    if (hostWS && hostWS.readyState === 1) {
+      hostWS.send(JSON.stringify({ type: 'everlink-relay-removed', mac: data.mac }));
+    }
+  });
+  inputDriver.events.on('everlink-error', (err) => {
+    console.error('[EverLink] error:', err.message, '(code:', err.code + ')');
+    if (hostWS && hostWS.readyState === 1) {
+      hostWS.send(JSON.stringify({ type: 'everlink-error', message: err.message, code: err.code || '' }));
+    }
+  });
+
   // ── C++ rumble callback — registered immediately after init so it fires
   // whether or not the Python sidecar is also running.
   // input-ready is a Python-only event so the old placement meant the callback
@@ -2297,6 +2325,36 @@ async function main() {
             inputPerms.set(msg.viewerId, { ...cur, slot: requestedSlot });
             broadcastRoster();
             toUinput({ type: 'force-slot', pad_id: msg.viewerId, slot: requestedSlot });
+            return;
+          }
+
+          // ── EverLink relay controls ───────────────────────────────────────────
+          // Host-only (this whole block lives under wsPath === "/ws/host"): only
+          // the machine physically wired to the Relay boards can scan/assign
+          // them, so there's no equivalent viewer-side message. See
+          // everlink_backend.py's module docstring for the full protocol and
+          // InputOrchestrator.js's everlinkScan/everlinkListRelays/
+          // everlinkAssign/everlinkForget for what each call does downstream.
+          // Replies arrive asynchronously via the inputDriver.events
+          // 'everlink-relay-list' / 'everlink-relay-added' /
+          // 'everlink-relay-removed' / 'everlink-error' listeners registered
+          // above, not as a direct return value here.
+          if (msg.type === "everlink-scan") {
+            inputDriver.everlinkScan();
+            return;
+          }
+          if (msg.type === "everlink-list") {
+            inputDriver.everlinkListRelays();
+            return;
+          }
+          if (msg.type === "everlink-assign") {
+            if (!msg.mac) return;
+            inputDriver.everlinkAssign(String(msg.mac), msg.padId ? String(msg.padId) : null);
+            return;
+          }
+          if (msg.type === "everlink-forget") {
+            if (!msg.mac) return;
+            inputDriver.everlinkForget(String(msg.mac));
             return;
           }
 

@@ -92,6 +92,121 @@ let _pythonProc = null;
 let _udpSocket = null;
 let _pythonUdpPort = 0;
 
+// ── EverLink Relay backend ──────────────────────────────────────────────────
+// Runs as its own long-lived Python sidecar, independent of (and alongside)
+// whichever OS output backend (_bridge / _pythonProc) is active above — a
+// Relay is an ADDITIONAL controller output (a real USB HID gamepad on some
+// other machine/console, fed over serial by an ESP32), not a replacement for
+// however Nearcade is already emulating input locally. See
+// everlink_backend.py's module docstring for the full protocol writeup, and
+// docs/everlink-integration.md for the end-to-end design.
+let _everlinkProc = null;
+let _everlinkStdoutBuf = '';
+const EVERLINK_SCRIPT = path.join(__dirname, 'everlink_backend.py').replace('app.asar', 'app.asar.unpacked');
+
+/// Lazily spawns the EverLink sidecar on first use (relay scan, or the panel
+/// being opened) rather than unconditionally at InputOrchestrator.init() time
+/// — most Nearcade hosts have no EverLink Relay hardware at all, so starting
+/// a Python process and holding it open for the lifetime of every session
+/// would be pure overhead for the common case.
+function _ensureEverlinkProc() {
+    if (_everlinkProc) return true;
+
+    if (!fs.existsSync(EVERLINK_SCRIPT)) {
+        console.error(`[everlink] Backend script not found at ${EVERLINK_SCRIPT}`);
+        events.emit('input-error', { message: 'EverLink backend script missing.', code: 'EVERLINK_MISSING' });
+        return false;
+    }
+
+    const pythonCmd = isWin ? 'python' : 'python3';
+    const spawnOpts = { stdio: ['pipe', 'pipe', 'pipe'] };
+    if (isWin) spawnOpts.windowsHide = true;
+    _everlinkProc = spawn(pythonCmd, ['-u', EVERLINK_SCRIPT], spawnOpts);
+
+    _everlinkProc.stderr.on('data', (chunk) => {
+        const s = chunk.toString('utf8').trim();
+        if (s) console.error('[everlink][stderr]', s);
+    });
+
+    _everlinkProc.stdout.on('data', (chunk) => {
+        _everlinkStdoutBuf += chunk.toString('utf8');
+        const lines = _everlinkStdoutBuf.split('\n');
+        _everlinkStdoutBuf = lines.pop();
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            let msg;
+            try { msg = JSON.parse(trimmed); }
+            catch (_) { console.log('[everlink]', trimmed); continue; }
+
+            switch (msg.type) {
+                case 'error':
+                    console.error(`[everlink] ${msg.message}`);
+                    events.emit('everlink-error', { message: msg.message, code: msg.code || 'EVERLINK_ERROR' });
+                    break;
+                case 'log':
+                    console.log('[everlink]', msg.message);
+                    break;
+                case 'ready':
+                    console.log('[everlink] Backend ready:', msg.message || '');
+                    break;
+                case 'relay_list':
+                    events.emit('everlink-relay-list', { relays: msg.relays || [] });
+                    break;
+                case 'relay_added':
+                    events.emit('everlink-relay-added', { relay: msg.relay });
+                    break;
+                case 'relay_removed':
+                    events.emit('everlink-relay-removed', { mac: msg.mac });
+                    break;
+                case 'rumble':
+                    // Same 'rumble' event server.js already listens on for the
+                    // uinputBridge C++ path — routes back to the owning viewer
+                    // regardless of which backend originated it.
+                    events.emit('rumble', {
+                        viewerId: msg.viewerId || '',
+                        strong: msg.strong || 0,
+                        weak: msg.weak || 0,
+                        duration: msg.duration || 200,
+                    });
+                    break;
+                default:
+                    break;
+            }
+        }
+    });
+
+    _everlinkProc.on('error', e => {
+        console.error('[everlink] Spawn error:', e.message);
+        events.emit('everlink-error', { message: `EverLink backend failed to start: ${e.message}`, code: 'SPAWN_ERROR' });
+        _everlinkProc = null;
+    });
+    _everlinkProc.on('close', (code) => {
+        console.log(`[everlink] Backend exited (code ${code})`);
+        _everlinkProc = null;
+    });
+
+    console.log(`[everlink] Backend started: ${EVERLINK_SCRIPT}`);
+    return true;
+}
+
+function _toEverlink(msg) {
+    if (!_ensureEverlinkProc()) return;
+    if (_everlinkProc && _everlinkProc.stdin.writable) {
+        try { _everlinkProc.stdin.write(JSON.stringify(msg) + '\n'); } catch (_) { /* best-effort */ }
+    }
+}
+
+/// Public entry points used by server.js's WS handlers (see server.js's
+/// "everlink-*" message types) — kept as named functions rather than routed
+/// through the generic send() dispatcher below because these aren't part of
+/// the gamepad/kbm validation pipeline at all; they're relay-management
+/// commands with their own shape.
+function everlinkScan() { _toEverlink({ type: 'everlink_scan' }); }
+function everlinkListRelays() { _toEverlink({ type: 'everlink_list' }); }
+function everlinkAssign(mac, padId) { _toEverlink({ type: 'everlink_assign', mac, pad_id: padId || null }); }
+function everlinkForget(mac) { _toEverlink({ type: 'everlink_forget', mac }); }
+
 // HIDMaestro backend toggle — set before init()
 let _hidmaestroEnabled = false;
 function setHidMaestroEnabled(enabled) {
@@ -537,6 +652,26 @@ function _handleGamepad(msg) {
     });
 }
 
+/// Forwards the same normalized gamepad message to the EverLink sidecar, if
+/// it's running. Cheap no-op (one dead process-existence check) when no
+/// Relay hardware is in use — see _ensureEverlinkProc's doc comment for why
+/// the process itself is spawned lazily rather than always-on. Called
+/// unconditionally alongside _handleGamepad (not only when a Relay happens
+/// to be assigned) because assignment can change between packets and the
+/// sidecar itself decides, per its own _latest_gamepad_state cache, which
+/// pad_id each Relay's send loop actually reads.
+function _forwardGamepadToEverlink(msg) {
+    if (!_everlinkProc) return; // not in use this session - avoid spawning it just to forward a packet nobody's listening for
+    _toEverlink({
+        type: 'gamepad',
+        pad_id: msg.pad_id,
+        buttons: msg.buttons || 0,
+        lt: msg.lt || 0, rt: msg.rt || 0,
+        lx: msg.lx || 0, ly: msg.ly || 0,
+        rx: msg.rx || 0, ry: msg.ry || 0,
+    });
+}
+
 function _emitKbmBinding(padId, key, isDown, binds) {
     const isFlat = typeof Object.values(binds)[0] === 'string';
     const slotIdx = viewerSlots.get(padId);
@@ -926,10 +1061,12 @@ function send(msg) {
         
         if (validated._ts && validated._ts > (lastPacketSequence.get(pId) || 0)) {
             _handleGamepad(validated);
+            _forwardGamepadToEverlink(validated);
             lastPacketSequence.set(pId, validated._ts);
             lastPacketTime.set(pId, Date.now()); 
         } else if (!validated._ts) {
             _handleGamepad(validated);
+            _forwardGamepadToEverlink(validated);
             lastPacketTime.set(pId, Date.now()); 
         }
     } else if (validated.type === 'kbm' || validated.type === 'keyboard') {
@@ -954,6 +1091,10 @@ function send(msg) {
         viewerModes.set(msg.viewerId, msg.mode);
     } else if (msg.type === 'disconnect_viewer') {
         _freeSlot(msg.viewer_id);
+        // Also clear any Relay assignment(s) pointing at this viewer's
+        // pad_id(s) — see everlink_backend.py's _do_disconnect_viewer.
+        // Cheap no-op if the EverLink sidecar isn't running this session.
+        if (_everlinkProc) _toEverlink({ type: 'disconnect_viewer', viewer_id: msg.viewer_id });
     } else if (msg.type === 'tournament-mode') {
         tournamentMode = !!msg.enabled;
         console.log(`[input] Tournament mode set to ${tournamentMode}. Resiliency disabled if true.`);
@@ -1062,6 +1203,11 @@ function destroy() {
         _pythonProc.kill();
         _pythonProc = null;
     }
+    if (_everlinkProc) {
+        _toEverlink({ type: 'destroy_all' });
+        _everlinkProc.kill();
+        _everlinkProc = null;
+    }
     console.log("[input] Orchestrator destroyed.");
 }
 
@@ -1085,10 +1231,30 @@ setInterval(() => {
                 lt: lastVars.lt || 0, 
                 rt: lastVars.rt || 0
             });
+            // Relays also need the decayed (neutral-stick) state, or a Relay
+            // would keep replaying the last real packet forever once a
+            // viewer's packets stop arriving — same reasoning as the
+            // _bridge/_pythonProc call just above, just for the EverLink
+            // output path.
+            if (_everlinkProc) {
+                _toEverlink({
+                    type: 'gamepad', pad_id: padId,
+                    buttons: lastMask, lx: 0, ly: 0, rx: 0, ry: 0,
+                    lt: lastVars.lt || 0, rt: lastVars.rt || 0,
+                });
+            }
             // Prevent spamming the buffer
             lastPacketTime.set(padId, 0); 
         }
     }
 }, 16);
 
-module.exports = { init, send, sendBinary, destroy, events, getViewerForSlot, setHidMaestroEnabled, setWindowsExperimentalEnabled, get _bridge() { return _bridge; } };
+module.exports = {
+    init, send, sendBinary, destroy, events, getViewerForSlot,
+    setHidMaestroEnabled, setWindowsExperimentalEnabled,
+    get _bridge() { return _bridge; },
+    // EverLink relay management — used by server.js's "everlink-*" WS
+    // message handlers. See everlink_backend.py's module docstring for what
+    // each of these does on the wire.
+    everlinkScan, everlinkListRelays, everlinkAssign, everlinkForget,
+};

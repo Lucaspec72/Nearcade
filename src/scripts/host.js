@@ -1585,6 +1585,13 @@ function connectWS() {
             if (typeof _refreshViewerPanel === 'function') _refreshViewerPanel();
             const vc = document.getElementById('viewerCount');
             if (vc) vc.textContent = msg.controllerCount ?? msg.viewers.length;
+            // Re-render EverLink assignment dropdowns too — the roster is
+            // their source of truth for available controllers (see
+            // _everlinkRoster()), and this WS message is the only signal
+            // that it changed.
+            if (typeof _renderEverlinkRelayList === 'function' && Object.keys(window._everlinkRelays || {}).length) {
+                _renderEverlinkRelayList();
+            }
         }
         if (msg.type === 'answer') {
             const pc = peerConnections[msg._viewerId];
@@ -1733,6 +1740,43 @@ function connectWS() {
         }
         if (msg.type === 'input-ready') {
             log('Input driver ready: ' + (msg.message || ''), 'ok');
+        }
+        if (msg.type === 'everlink-relay-list') {
+            // Full replace — the sidecar always sends its complete current
+            // set, not a diff (see everlink_backend.py's _emit_relay_list),
+            // so mirroring that here keeps this the single source of truth
+            // rather than accumulating stale entries.
+            const byMac = {};
+            (msg.relays || []).forEach(r => { if (r && r.mac) byMac[r.mac] = r; });
+            window._everlinkRelays = byMac;
+            _renderEverlinkRelayList();
+        }
+        if (msg.type === 'everlink-relay-added') {
+            if (msg.relay && msg.relay.mac) {
+                window._everlinkRelays[msg.relay.mac] = msg.relay;
+                _renderEverlinkRelayList();
+                log('EverLink Relay found: ' + msg.relay.mac + ' (' + (msg.relay.chipModel || 'unknown chip') + ')', 'ok');
+            }
+        }
+        if (msg.type === 'everlink-relay-removed') {
+            if (msg.mac) {
+                delete window._everlinkRelays[msg.mac];
+                _renderEverlinkRelayList();
+            }
+        }
+        if (msg.type === 'everlink-error') {
+            console.error('[EverLink]', msg.message);
+            log('EverLink: ' + msg.message, 'err');
+            if (window.showError) window.showError('EverLink: ' + msg.message, 'yellow');
+            // Also stop any in-flight scan spinner — an error reply means the
+            // scan this most likely came from isn't going to finish cleanly.
+            _everlinkScanInFlight = false;
+            const btn = document.getElementById('everlinkScanBtn');
+            const icon = document.getElementById('everlinkScanIcon');
+            const status = document.getElementById('everlinkScanStatus');
+            if (btn) btn.disabled = false;
+            if (icon) icon.style.animation = '';
+            if (status) status.textContent = '';
         }
         if (msg.type === 'regen-pin') {
             currentPin = msg.pin;
@@ -6242,7 +6286,170 @@ function addExpDevice(inVal, inText, inEnabled = true) {
     saveExpDevices();
 }
 
-window._hostDelayEnabled = localStorage.getItem('ns_ctrl_hostDelay') !== 'false'; // Defaults to true
+// ── EverLink Relays panel ────────────────────────────────────────────────────
+// Client-side half of the EverLink integration. The server (server.js) owns
+// the "everlink-*" WS message contract and forwards them to
+// InputOrchestrator.js, which talks to the everlink_backend.py sidecar — see
+// that file's module docstring for the full wire protocol writeup. This
+// panel only does three things: ask for a (re)scan, render whatever relay
+// list comes back, and send an assign/forget when the user picks a
+// controller from a relay's dropdown.
+
+// mac -> relay dict, as last received from the server. Kept as the single
+// source of truth for re-rendering so a WS 'everlink-relay-list' push at any
+// time (not just right after a scan — e.g. a Relay dropping out on its own)
+// keeps the panel in sync without the panel having to ask again.
+window._everlinkRelays = {};
+
+function showEverlinkModal() {
+    closeAllModals();
+    document.getElementById('everlinkModal').classList.remove('gone');
+    // Ask the host process for whatever it already knows (no rescan — a
+    // rescan is a deliberate, explicit action via the Scan button, since it
+    // briefly opens every unclaimed serial port on the system and that's not
+    // something to do silently just because the user opened the panel).
+    if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'everlink-list' }));
+    }
+}
+
+let _everlinkScanInFlight = false;
+function everlinkScan() {
+    if (!ws || ws.readyState !== 1) { log('Not connected to host.', 'err'); return; }
+    if (_everlinkScanInFlight) return;
+    _everlinkScanInFlight = true;
+
+    const btn = document.getElementById('everlinkScanBtn');
+    const icon = document.getElementById('everlinkScanIcon');
+    const status = document.getElementById('everlinkScanStatus');
+    if (btn) btn.disabled = true;
+    if (icon) icon.style.animation = 'spin 0.8s linear infinite';
+    if (status) status.textContent = 'Scanning serial ports…';
+
+    ws.send(JSON.stringify({ type: 'everlink-scan' }));
+
+    // The scan itself has no single "done" reply (relay_list can also arrive
+    // from unrelated pushes), so this is a soft UI timeout rather than a real
+    // completion signal — matches how the rest of this file treats
+    // fire-and-forget WS actions elsewhere (e.g. regen-pin).
+    setTimeout(() => {
+        _everlinkScanInFlight = false;
+        if (btn) btn.disabled = false;
+        if (icon) icon.style.animation = '';
+        if (status) status.textContent = '';
+    }, 2500);
+}
+
+function everlinkAssign(mac, padId) {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'everlink-assign', mac, padId: padId || null }));
+}
+
+function everlinkForget(mac) {
+    if (!ws || ws.readyState !== 1) return;
+    if (!confirm('Forget this Relay? It will need to be re-scanned to use again.')) return;
+    ws.send(JSON.stringify({ type: 'everlink-forget', mac }));
+}
+
+function _everlinkChipIcon(relay) {
+    if (!relay.isUsbCapable) return '⚠️';
+    return relay.responsive ? '🟢' : '🟡';
+}
+
+function _everlinkRoster() {
+    // Reuses whatever roster data the existing viewer panel already tracks
+    // (see renderRoster / window._rosterData) so the assignment dropdown
+    // lists the same names/ids the rest of the host UI uses — v.id is the
+    // same pad_id InputOrchestrator.js and everlink_backend.py both key on.
+    if (Array.isArray(window._rosterData)) return window._rosterData;
+    if (typeof _lastRosterList !== 'undefined' && Array.isArray(_lastRosterList)) return _lastRosterList;
+    return [];
+}
+
+function _renderEverlinkRelay(relay) {
+    const el = document.createElement('div');
+    el.dataset.mac = relay.mac;
+    el.style.cssText = "display:flex; flex-direction:column; gap:8px; padding:10px 12px; background:rgba(0,0,0,0.3); border:1px solid var(--border); border-radius:8px;";
+
+    const issuesHtml = (relay.issues || []).length
+        ? `<div style="margin-top:4px; font-size:9px; color:var(--warn); line-height:1.4;">${relay.issues.map(i => '⚠ ' + i.replace(/[<>]/g, '')).join('<br>')}</div>`
+        : '';
+
+    const roster = _everlinkRoster();
+    const optionsHtml = ['<option value="">— No controller —</option>']
+        .concat(roster.map(v => {
+            const label = (v.name || v.id || '').toString().replace(/[<>"'&]/g, '');
+            const selected = relay.assignedPadId === v.id ? ' selected' : '';
+            return `<option value="${v.id}"${selected}>${label}${v.id === 'host_0' ? ' (Host)' : ''}</option>`;
+        }))
+        .join('');
+
+    // If the relay is assigned to a pad_id that isn't in the current roster
+    // (e.g. that viewer just disconnected), still show it as a labeled,
+    // selected option rather than silently reverting the dropdown to "None"
+    // — the assignment is still live server-side until explicitly cleared.
+    const assignedKnown = relay.assignedPadId && roster.some(v => v.id === relay.assignedPadId);
+    const extraOption = (relay.assignedPadId && !assignedKnown)
+        ? `<option value="${relay.assignedPadId}" selected>${relay.assignedPadId} (disconnected)</option>`
+        : '';
+
+    el.innerHTML = `
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <div style="display:flex; align-items:center; gap:8px; min-width:0;">
+                <span style="font-size:13px;">${_everlinkChipIcon(relay)}</span>
+                <div style="min-width:0;">
+                    <div style="font-size:11px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${(relay.chipModel || 'Unknown').replace(/[<>]/g, '')}</div>
+                    <div style="font-size:9px; color:var(--muted2); font-family:var(--mono);">${relay.mac} · ${(relay.port || '').replace(/[<>]/g, '')} · v${relay.protocolVersion}</div>
+                </div>
+            </div>
+            <button onclick="everlinkForget('${relay.mac}')" title="Forget this Relay" class="close-modal" style="width:22px; height:22px; border:none; background:transparent; flex-shrink:0;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px; height:13px;">
+                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+            </button>
+        </div>
+        <select class="form-select" style="width:100%;" onchange="everlinkAssign('${relay.mac}', this.value)">
+            ${optionsHtml}${extraOption}
+        </select>
+        ${issuesHtml}
+    `;
+    return el;
+}
+
+function _renderEverlinkRelayList() {
+    const list = document.getElementById('everlinkRelayList');
+    const empty = document.getElementById('everlinkEmptyState');
+    if (!list) return;
+
+    const relays = Object.values(window._everlinkRelays);
+
+    // Don't rebuild a <select> the user currently has focused/open — same
+    // guard renderRoster() uses, for the same reason (a rebuild mid-click
+    // silently discards the pending selection).
+    if (document.activeElement && document.activeElement.tagName === 'SELECT' && list.contains(document.activeElement)) {
+        return;
+    }
+
+    list.querySelectorAll('[data-mac]').forEach(n => n.remove());
+    if (empty) empty.style.display = relays.length ? 'none' : '';
+
+    relays
+        .sort((a, b) => (a.mac || '').localeCompare(b.mac || ''))
+        .forEach(relay => list.appendChild(_renderEverlinkRelay(relay)));
+
+    const badge = document.getElementById('everlinkModalBadge');
+    if (badge) {
+        if (relays.length) {
+            badge.textContent = relays.length;
+            badge.style.display = '';
+        } else {
+            badge.style.display = 'none';
+        }
+    }
+}
+
+
 window.toggleHostDelay = function (enabled) {
     window._hostDelayEnabled = enabled;
     localStorage.setItem('ns_ctrl_hostDelay', enabled ? 'true' : 'false');
